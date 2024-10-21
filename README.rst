@@ -2,16 +2,11 @@
 Welcome to python-binance v1.0.19
 =================================
 
-Updated 11th Aug 2023
-
 .. image:: https://img.shields.io/pypi/v/python-binance.svg
     :target: https://pypi.python.org/pypi/python-binance
 
 .. image:: https://img.shields.io/pypi/l/python-binance.svg
     :target: https://pypi.python.org/pypi/python-binance
-
-.. image:: https://img.shields.io/travis/sammchardy/python-binance.svg
-    :target: https://travis-ci.org/sammchardy/python-binance
 
 .. image:: https://img.shields.io/coveralls/sammchardy/python-binance.svg
     :target: https://coveralls.io/github/sammchardy/python-binance
@@ -22,12 +17,14 @@ Updated 11th Aug 2023
 .. image:: https://img.shields.io/pypi/pyversions/python-binance.svg
     :target: https://pypi.python.org/pypi/python-binance
 
+.. image:: https://img.shields.io/badge/Telegram-Join%20Us-blue?logo=Telegram
+    :target: https://t.me/python_binance
+
+
 This is an unofficial Python wrapper for the `Binance exchange REST API v3 <https://binance-docs.github.io/apidocs/spot/en>`_. I am in no way affiliated with Binance, use at your own risk.
 
-If you came here looking for the `Binance exchange <https://www.binance.com/?ref=10099792>`_ to purchase cryptocurrencies, then `go here <https://www.binance.com/?ref=10099792>`_.
+If you came here looking for the `Binance exchange <https://accounts.binance.com/en/register?ref=D7YA7CLY>`_ to purchase cryptocurrencies, then `go here <https://accounts.binance.com/en/register?ref=D7YA7CLY>`_.
 If you want to automate interactions with Binance stick around.
-
-If you're interested in Binance's new DEX Binance Chain see my `python-binance-chain library <https://github.com/sammchardy/python-binance-chain>`_
 
 Source code
   https://github.com/sammchardy/python-binance
@@ -35,11 +32,14 @@ Source code
 Documentation
   https://python-binance.readthedocs.io/en/latest/
 
-Binance API Telegram
-  https://t.me/binance_api_english
+Community Telegram Chat
+  https://t.me/python_binance
 
-Blog with examples including async
-  https://sammchardy.github.io
+Announcements Channel
+  https://t.me/python_binance_announcements
+
+Examples including async
+  https://github.com/sammchardy/python-binance/tree/master/examples
 
 - `Async basics for Binance <https://sammchardy.github.io/binance/2021/05/01/async-binance-basics.html>`_
 - `Understanding Binance Order Filters <https://sammchardy.github.io/binance/2021/05/03/binance-order-filters.html>`_
@@ -52,7 +52,7 @@ Features
 - Implementation of all General, Market Data and Account endpoints.
 - Asyncio implementation
 - Testnet support for Spot, Futures and Vanilla Options
-- Simple handling of authentication include RSA keys
+- Simple handling of authentication include RSA and EDDSA keys
 - No need to generate timestamps yourself, the wrapper does it for you
 - Response exception handling
 - Websocket handling with reconnection and multiplexed connections
@@ -62,6 +62,7 @@ Features
 - Deposit addresses
 - Margin Trading
 - Futures Trading
+- Porfolio Margin Trading
 - Vanilla Options
 - Support other domains (.us, .jp, etc)
 
@@ -79,7 +80,7 @@ converted to use Asynchronous Context Managers. See examples in the Async sectio
 Quick Start
 -----------
 
-`Register an account with Binance <https://accounts.binance.com/en/register?ref=10099792>`_.
+`Register an account with Binance <https://accounts.binance.com/en/register?ref=D7YA7CLY>`_.
 
 `Generate an API Key <https://www.binance.com/en/my/settings/api-management>`_ and assign relevant permissions.
 
@@ -258,23 +259,7 @@ for more information.
         loop.run_until_complete(main())
 
 
-Donate
-------
-
-If this library helped you out feel free to donate.
-
-- ETH: 0xD7a7fDdCfA687073d7cC93E9E51829a727f9fE70
-- LTC: LPC5vw9ajR1YndE1hYVeo3kJ9LdHjcRCUZ
-- NEO: AVJB4ZgN7VgSUtArCt94y7ZYT6d5NDfpBo
-- BTC: 1Dknp6L6oRZrHDECRedihPzx2sSfmvEBys
-
 Other Exchanges
 ---------------
 
-If you use `Binance Chain <https://testnet.binance.org/>`_ check out my `python-binance-chain <https://github.com/sammchardy/python-binance-chain>`_ library.
-
-If you use `Kucoin <https://www.kucoin.com/?rcode=E42cWB>`_ check out my `python-kucoin <https://github.com/sammchardy/python-kucoin>`_ library.
-
-If you use `IDEX <https://idex.market>`_ check out my `python-idex <https://github.com/sammchardy/python-idex>`_ library.
-
-.. image:: https://ga-beacon.appspot.com/UA-111417213-1/github/python-binance?pixel&useReferer
+If you use `Kucoin <https://www.kucoin.com/ucenter/signup?rcode=E5wkqe>`_ check out my `python-kucoin <https://github.com/sammchardy/python-kucoin>`_ library.

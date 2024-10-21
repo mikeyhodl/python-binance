@@ -1,5 +1,6 @@
 from base64 import b64encode
 from pathlib import Path
+import random
 from typing import Dict, Optional, List, Tuple, Union, Any
 
 import aiohttp
@@ -8,9 +9,9 @@ import hashlib
 import hmac
 import requests
 import time
-from Crypto.PublicKey import RSA
+from Crypto.PublicKey import RSA, ECC
 from Crypto.Hash import SHA256
-from Crypto.Signature import pkcs1_15
+from Crypto.Signature import pkcs1_15, eddsa
 from operator import itemgetter
 from urllib.parse import urlencode
 
@@ -35,6 +36,7 @@ class BaseClient:
     FUTURES_COIN_DATA_TESTNET_URL = 'https://testnet.binancefuture.com/futures/data'
     OPTIONS_URL = 'https://eapi.binance.{}/eapi'
     OPTIONS_TESTNET_URL = 'https://testnet.binanceops.{}/eapi'
+    PAPI_URL = 'https://papi.binance.{}/papi'
     PUBLIC_API_VERSION = 'v1'
     PRIVATE_API_VERSION = 'v3'
     MARGIN_API_VERSION = 'v1'
@@ -43,7 +45,11 @@ class BaseClient:
     MARGIN_API_VERSION4 = 'v4'
     FUTURES_API_VERSION = 'v1'
     FUTURES_API_VERSION2 = 'v2'
+    FUTURES_API_VERSION3 = 'v3'
     OPTIONS_API_VERSION = 'v1'
+    PORTFOLIO_API_VERSION = 'v1'
+    PORTFOLIO_API_VERSION2 = 'v2'
+
 
     BASE_ENDPOINT_DEFAULT = ''
     BASE_ENDPOINT_1 = '1'
@@ -136,6 +142,10 @@ class BaseClient:
     MINING_TO_USDT_FUTURE = "MINING_UMFUTURE"
     MINING_TO_FIAT = "MINING_C2C"
 
+    ## order ids
+    SPOT_ORDER_PREFIX = "HNA2TXFJ"
+    CONTRACT_ORDER_PREFIX = "Cb7ytekJ"
+
     def __init__(
         self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
         requests_params: Optional[Dict[str, Any]] = None, tld: str = 'com', base_endpoint: str = BASE_ENDPOINT_DEFAULT,
@@ -171,6 +181,7 @@ class BaseClient:
 
         self.API_KEY = api_key
         self.API_SECRET = api_secret
+        self._is_rsa = False
         self.PRIVATE_KEY = self._init_private_key(private_key, private_key_pass)
         self.session = self._init_session()
         self._requests_params = requests_params
@@ -197,7 +208,10 @@ class BaseClient:
         if isinstance(private_key, Path):
             with open(private_key, "r") as f:
                 private_key = f.read()
-        return RSA.import_key(private_key, passphrase=private_key_pass)
+        if len(private_key) > 120:
+            self._is_rsa = True
+            return RSA.import_key(private_key, passphrase=private_key_pass)
+        return ECC.import_key(private_key)
 
     def _create_api_uri(self, path: str, signed: bool = True, version: str = PUBLIC_API_VERSION) -> str:
         url = self.API_URL
@@ -215,6 +229,13 @@ class BaseClient:
         }
         return self.MARGIN_API_URL + '/' + options[version] + '/' + path
 
+    def _create_papi_api_uri(self, path: str, version: int = 1) -> str:
+        options = {
+            1: self.PORTFOLIO_API_VERSION,
+            2: self.PORTFOLIO_API_VERSION2
+        }
+        return self.PAPI_URL.format(self.tld) + '/' + options[version] + '/' + path
+
     def _create_website_uri(self, path: str) -> str:
         return self.WEBSITE_URL + '/' + path
 
@@ -222,7 +243,7 @@ class BaseClient:
         url = self.FUTURES_URL
         if self.testnet:
             url = self.FUTURES_TESTNET_URL
-        options = {1: self.FUTURES_API_VERSION, 2: self.FUTURES_API_VERSION2}
+        options = {1: self.FUTURES_API_VERSION, 2: self.FUTURES_API_VERSION2, 3: self.FUTURES_API_VERSION3}
         return url + '/' + options[version] + '/' + path
 
     def _create_futures_data_api_uri(self, path: str) -> str:
@@ -235,7 +256,7 @@ class BaseClient:
         url = self.FUTURES_COIN_URL
         if self.testnet:
             url = self.FUTURES_COIN_TESTNET_URL
-        options = {1: self.FUTURES_API_VERSION, 2: self.FUTURES_API_VERSION2}
+        options = {1: self.FUTURES_API_VERSION, 2: self.FUTURES_API_VERSION2, 3: self.FUTURES_API_VERSION3}
         return url + "/" + options[version] + "/" + path
 
     def _create_futures_coin_data_api_url(self, path: str, version: int = 1) -> str:
@@ -256,6 +277,10 @@ class BaseClient:
         signature = pkcs1_15.new(self.PRIVATE_KEY).sign(h)
         return b64encode(signature).decode()
 
+    def _ed25519_signature(self, query_string: str):
+        assert self.PRIVATE_KEY
+        return b64encode(eddsa.new(self.PRIVATE_KEY, "rfc8032").sign(query_string.encode())).decode()
+
     def _hmac_signature(self, query_string: str) -> str:
         assert self.API_SECRET, "API Secret required for private endpoints"
         m = hmac.new(self.API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256)
@@ -264,9 +289,24 @@ class BaseClient:
     def _generate_signature(self, data: Dict) -> str:
         sig_func = self._hmac_signature
         if self.PRIVATE_KEY:
-            sig_func = self._rsa_signature
+            if self._is_rsa:
+                sig_func = self._rsa_signature
+            else:
+                sig_func = self._ed25519_signature
         query_string = '&'.join([f"{d[0]}={d[1]}" for d in self._order_params(data)])
         return sig_func(query_string)
+
+    @staticmethod
+    def _get_version(version: int, **kwargs) -> int:
+        if 'data' in kwargs and 'version' in kwargs['data']:
+            version_override = kwargs['data'].get('version')
+            del kwargs['data']['version']
+            return version_override
+        return version
+
+    @staticmethod
+    def uuid22(length=22):
+        return format(random.getrandbits(length * 4), 'x')
 
     @staticmethod
     def _order_params(data: Dict) -> List[Tuple[str, str]]:
@@ -341,13 +381,15 @@ class Client(BaseClient):
         self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
         requests_params: Optional[Dict[str, Any]] = None, tld: str = 'com',
         base_endpoint: str = BaseClient.BASE_ENDPOINT_DEFAULT, testnet: bool = False,
-        private_key: Optional[Union[str, Path]] = None, private_key_pass: Optional[str] = None
+        private_key: Optional[Union[str, Path]] = None, private_key_pass: Optional[str] = None,
+        ping: Optional[bool] = True
     ):
 
         super().__init__(api_key, api_secret, requests_params, tld, base_endpoint, testnet, private_key, private_key_pass)
 
         # init DNS and SSL cert
-        self.ping()
+        if ping:
+            self.ping()
 
     def _init_session(self) -> requests.Session:
 
@@ -384,6 +426,7 @@ class Client(BaseClient):
         return self._request(method, uri, signed, **kwargs)
 
     def _request_futures_api(self, method, path, signed=False, version: int = 1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_futures_api_uri(path, version)
 
         return self._request(method, uri, signed, True, **kwargs)
@@ -394,11 +437,13 @@ class Client(BaseClient):
         return self._request(method, uri, signed, True, **kwargs)
 
     def _request_futures_coin_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_futures_coin_api_url(path, version=version)
 
         return self._request(method, uri, signed, True, **kwargs)
 
     def _request_futures_coin_data_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_futures_coin_data_api_url(path, version=version)
 
         return self._request(method, uri, signed, True, **kwargs)
@@ -409,8 +454,14 @@ class Client(BaseClient):
         return self._request(method, uri, signed, True, **kwargs)
 
     def _request_margin_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_margin_api_uri(path, version)
 
+        return self._request(method, uri, signed, **kwargs)
+
+    def _request_papi_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
+        uri = self._create_papi_api_uri(path, version)
         return self._request(method, uri, signed, **kwargs)
 
     def _request_website(self, method, path, signed=False, **kwargs) -> Dict:
@@ -1302,6 +1353,45 @@ class Client(BaseClient):
         """
         return self._get('ticker/price', data=params, version=self.PRIVATE_API_VERSION)
 
+
+    def get_symbol_ticker_window(self, **params):
+        """Latest price for a symbol or symbols.
+
+        https://binance-docs.github.io/apidocs/spot/en/#rolling-window-price-change-statistics
+
+        :param symbol:
+        :type symbol: str
+
+        :returns: API response
+
+        .. code-block:: python
+
+            {
+                "symbol": "LTCBTC",
+                "price": "4.00000200"
+            }
+
+        OR
+
+        .. code-block:: python
+
+            [
+                {
+                    "symbol": "LTCBTC",
+                    "price": "4.00000200"
+                },
+                {
+                    "symbol": "ETHBTC",
+                    "price": "0.07946600"
+                }
+            ]
+
+        :raises: BinanceRequestException, BinanceAPIException
+
+        """
+        return self._get('ticker', data=params, version=self.PRIVATE_API_VERSION)
+
+
     def get_orderbook_ticker(self, **params):
         """Latest price for a symbol or symbols.
 
@@ -1467,6 +1557,8 @@ class Client(BaseClient):
         :raises: BinanceRequestException, BinanceAPIException, BinanceOrderException, BinanceOrderMinAmountException, BinanceOrderMinPriceException, BinanceOrderMinTotalException, BinanceOrderUnknownSymbolException, BinanceOrderInactiveSymbolException
 
         """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.SPOT_ORDER_PREFIX + self.uuid22()
         return self._post('order', True, data=params)
 
     def order_limit(self, timeInForce=BaseClient.TIME_IN_FORCE_GTC, **params):
@@ -2696,7 +2788,7 @@ class Client(BaseClient):
             ]
 
         """
-        if self.tld == 'us'
+        if self.tld == 'us':
             endpoint = 'asset/query/trading-fee'
         else:
             endpoint = 'asset/tradeFee'
@@ -4439,6 +4531,8 @@ class Client(BaseClient):
             BinanceOrderInactiveSymbolException
 
         """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.SPOT_ORDER_PREFIX + self.uuid22()
         return self._request_margin_api('post', 'margin/order', signed=True, data=params)
 
     def cancel_margin_order(self, **params):
@@ -5365,7 +5459,7 @@ class Client(BaseClient):
             ]
 
     """
-        return self._request_margin_api('get', 'margin/allOrderList', signed=True, data=params)
+        return self._request_margin_api('get', 'margin/openOrderList', signed=True, data=params)
 
     # Cross-margin
 
@@ -7301,8 +7395,10 @@ class Client(BaseClient):
         https://binance-docs.github.io/apidocs/futures/en/#new-order-trade
 
         """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
         return self._request_futures_api('post', 'order', True, data=params)
-    
+
     def futures_modify_order(self, **params):
         """Modify an existing order. Currently only LIMIT order modification is supported.
 
@@ -7407,10 +7503,10 @@ class Client(BaseClient):
     def futures_account_balance(self, **params):
         """Get futures account balance
 
-        https://binance-docs.github.io/apidocs/futures/en/#future-account-balance-user_data
+        https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Futures-Account-Balance-V3
 
         """
-        return self._request_futures_api('get', 'balance', True, 2, data=params)
+        return self._request_futures_api('get', 'balance', True, 3, data=params)
 
     def futures_account(self, **params):
         """Get current account information.
@@ -7458,7 +7554,7 @@ class Client(BaseClient):
         https://binance-docs.github.io/apidocs/futures/en/#position-information-user_data
 
         """
-        return self._request_futures_api('get', 'positionRisk', True, 2, data=params)
+        return self._request_futures_api('get', 'positionRisk', True, 3, data=params)
 
     def futures_account_trades(self, **params):
         """Get trades for the authenticated account and symbol.
@@ -7526,6 +7622,13 @@ class Client(BaseClient):
             'listenKey': listenKey
         }
         return self._request_futures_api('delete', 'listenKey', signed=False, data=params)
+
+    # new methods
+    def futures_account_config(self, **params):
+        return self._request_futures_api('get', 'accountConfig', signed=True, version=1, data=params)
+
+    def futures_symbol_config(self, **params):
+        return self._request_futures_api('get', 'symbolConfig', signed=True, version=1, data=params)
 
     # COIN Futures API
     def futures_coin_ping(self):
@@ -8353,6 +8456,8 @@ class Client(BaseClient):
         :type recvWindow: int
 
         """
+        if 'clientOrderId' not in params:
+            params['clientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
         return self._request_options_api('post', 'order', signed=True, data=params)
 
     def options_place_batch_order(self, **params):
@@ -8669,6 +8774,1244 @@ class Client(BaseClient):
         """
         return self._request_margin_api('post', 'convert/acceptQuote', signed=True, data=params)
 
+    """
+    ====================================================================================================================
+    PortfolioMargin API
+    ====================================================================================================================
+    """
+
+    def papi_get_balance(self, **params):
+        """Query account balance.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account
+
+        :param asset: required
+        :type asset: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'balance', signed=True, data=params)
+
+    def papi_get_account(self, **params):
+        """Query account information.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Account-Information
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'account', signed=True, data=params)
+
+    def papi_get_margin_max_borrowable(self, **params):
+        """Query margin max borrow.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Margin-Max-Borrow
+
+        :param asset: required
+        :type asset: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/maxBorrowable', signed=True, data=params)
+
+
+    def papi_get_margin_max_withdraw(self, **params):
+        """Query margin max borrow.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Query-Margin-Max-Withdraw
+
+        :param asset: required
+        :type asset: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/maxWithdraw', signed=True, data=params)
+
+
+    def papi_get_um_position_risk(self, **params):
+        """Query margin max borrow.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Query-UM-Position-Information
+
+        :param symbol: required
+        :type symbol: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/positionRisk', signed=True, data=params)
+
+
+
+    def papi_get_cm_position_risk(self, **params):
+        """Query margin max borrow.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Query-CM-Position-Information
+
+        :param asset: required
+        :type asset: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/positionRisk', signed=True, data=params)
+
+
+
+    def papi_set_um_leverage(self, **params):
+        """Query margin max borrow.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Change-UM-Initial-Leverage
+
+        :param asset: required
+        :type asset: str
+
+        :param leverage: required
+        :type leverage: int
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'um/leverage', signed=True, data=params)
+
+
+    def papi_set_cm_leverage(self, **params):
+        """Query margin max borrow.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Change-CM-Initial-Leverage
+
+        :param asset: required
+        :type asset: str
+
+        :param leverage: required
+        :type leverage: int
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'cm/leverage', signed=True, data=params)
+
+
+    def papi_change_um_position_side_dual(self, **params):
+        """Change user's position mode (Hedge Mode or One-way Mode ) on EVERY symbol in UM.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Change-UM-Position-Mode
+
+        :param dualSidePosition: required
+        :type dualSidePosition: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'um/positionSide/dual', signed=True, data=params)
+
+
+    def papi_get_um_position_side_dual(self, **params):
+        """Get user's position mode (Hedge Mode or One-way Mode ) on EVERY symbol in UM.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Current-Position-Mode
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/positionSide/dual', signed=True, data=params)
+
+
+    def papi_get_cm_position_side_dual(self, **params):
+        """Get user's position mode (Hedge Mode or One-way Mode ) on EVERY symbol in CM.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-CM-Current-Position-Mode
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/positionSide/dual', signed=True, data=params)
+
+
+    def papi_get_um_leverage_bracket(self, **params):
+        """Query UM notional and leverage brackets.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Margin-Max-Borrow
+
+        :param symbol: optional
+        :type symbol: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/leverageBracket', signed=True, data=params)
+
+
+    def papi_get_cm_leverage_bracket(self, **params):
+        """Query CM notional and leverage brackets.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/CM-Notional-and-Leverage-Brackets
+
+        :param symbol: optional
+        :type symbol: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/leverageBracket', signed=True, data=params)
+
+    def papi_get_um_api_trading_status(self, **params):
+        """Portfolio Margin UM Trading Quantitative Rules Indicators.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Portfolio-Margin-UM-Trading-Quantitative-Rules-Indicators
+
+        :param symbol: optional
+        :type symbol: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/apiTradingStatus', signed=True, data=params)
+
+
+    def papi_get_um_comission_rate(self, **params):
+        """Get User Commission Rate for UM.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-User-Commission-Rate-for-UM
+
+        :param symbol: required
+        :type symbol: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/commissionRate', signed=True, data=params)
+
+
+    def papi_get_cm_comission_rate(self, **params):
+        """Get User Commission Rate for CM.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-User-Commission-Rate-for-CM
+
+        :param symbol: required
+        :type symbol: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/commissionRate', signed=True, data=params)
+
+    def papi_get_margin_margin_loan(self, **params):
+        """Query margin loan record.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Query-Margin-Loan-Record
+
+        :param asset: required
+        :type asset: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/marginLoan', signed=True, data=params)
+
+    def papi_get_margin_repay_loan(self, **params):
+        """Query margin repay record.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Query-Margin-repay-Record
+
+        :param asset: required
+        :type asset: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/repayLoan', signed=True, data=params)
+
+
+    def papi_get_repay_futures_switch(self, **params):
+        """Query Auto-repay-futures Status.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-Auto-repay-futures-Status
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'repay-futures-switch', signed=True, data=params)
+
+
+    def papi_repay_futures_switch(self, **params):
+        """Change Auto-repay-futures Status.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Change-Auto-repay-futures-Status
+
+        :param autoRepay: required
+        :type autoRepay: str
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'repay-futures-switch', signed=True, data=params)
+
+
+    def papi_get_margin_interest_history(self, **params):
+        """Get Margin Borrow/Loan Interest History.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-Margin-BorrowLoan-Interest-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/marginInterestHistory', signed=True, data=params)
+
+
+    def papi_repay_futures_negative_balance(self, **params):
+        """Repay futures Negative Balance.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Repay-futures-Negative-Balance
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'repay-futures-negative-balance', signed=True, data=params)
+
+
+    def papi_get_portfolio_interest_history(self, **params):
+        """GQuery interest history of negative balance for portfolio margin.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Query-Portfolio-Margin-Negative-Balance-Interest-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'portfolio/interest-history', signed=True, data=params)
+
+
+    def papi_fund_auto_collection(self, **params):
+        """Fund collection for Portfolio Margin.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Fund-Auto-collection
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'auto-collection', signed=True, data=params)
+
+
+    def papi_fund_asset_collection(self, **params):
+        """Transfers specific asset from Futures Account to Margin account.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Fund-Collection-by-Asset
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'asset-collection', signed=True, data=params)
+
+
+    def papi_bnb_transfer(self, **params):
+        """Transfer BNB in and out of UM.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/BNB-transfer
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'bnb-transfer', signed=True, data=params)
+
+
+    def papi_get_um_income_history(self, **params):
+        """Get UM Income History.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Income-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/income', signed=True, data=params)
+
+
+    def papi_get_cm_income_history(self, **params):
+        """Get CM Income History.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-CM-Income-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/income', signed=True, data=params)
+
+
+    def papi_get_um_account(self, **params):
+        """Get current UM account asset and position information.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Account-Detail
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/account', signed=True, data=params)
+
+    def papi_get_um_account_v2(self, **params):
+        """Get current UM account asset and position information.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Account-Detail
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/account', version=2, signed=True, data=params)
+
+
+    def papi_get_cm_account(self, **params):
+        """Get current CM account asset and position information.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-CM-Account-Detail
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/account', signed=True, data=params)
+
+
+    def papi_get_um_account_config(self, **params):
+        """Query UM Futures account configuration.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Futures-Account-Config
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/accountConfig', signed=True, data=params)
+
+
+    def papi_get_um_symbol_config(self, **params):
+        """Get current UM account symbol configuration.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Futures-Symbol-Config
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/symbolConfig', signed=True, data=params)
+
+
+    def papi_get_um_trade_asyn(self, **params):
+        """Get download id for UM futures trade history.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-Download-Id-For-UM-Futures-Trade-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/trade/asyn', signed=True, data=params)
+
+
+    def papi_get_um_trade_asyn_id(self, **params):
+        """Get UM futures trade download link by Id.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-Download-Id-For-UM-Futures-Trade-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/trade/asyn/id', signed=True, data=params)
+
+
+
+    def papi_get_um_order_asyn(self, **params):
+        """Get download id for UM futures order history.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-Download-Id-For-UM-Futures-Order-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/order/asyn', signed=True, data=params)
+
+
+    def papi_get_um_order_asyn_id(self, **params):
+        """Get UM futures order download link by Id.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Futures-Order-Download-Link-by-Id
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/order/asyn/id', signed=True, data=params)
+
+
+    def papi_get_um_income_asyn(self, **params):
+        """Get download id for UM futures transaction history.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-Download-Id-For-UM-Futures-Transaction-History
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/income/asyn', signed=True, data=params)
+
+
+    def papi_get_um_income_asyn_id(self, **params):
+        """Get UM futures Transaction download link by Id.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/account/Get-UM-Futures-Transaction-Download-Link-by-Id
+
+        :param recvWindow: optional
+        :type recvWindow: int
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/income/asyn/id', signed=True, data=params)
+
+    # Public papi endpoints
+
+    def papi_ping(self, **params):
+        """Test connectivity to the Rest API.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/market-data
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'ping', signed=False, data=params)
+
+    # Trade papi endpoints
+
+    def papi_create_um_order(self, **params):
+        """Place new UM order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return self._request_papi_api('post', 'um/order', signed=True, data=params)
+
+
+    def papi_create_um_conditional_order(self, **params):
+        """Place new UM Conditional order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-UM-Conditional-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return self._request_papi_api('post', 'um/conditional/order', signed=True, data=params)
+
+
+    def papi_create_cm_order(self, **params):
+        """Place new CM order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-CM-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return self._request_papi_api('post', 'cm/order', signed=True, data=params)
+
+
+    def papi_create_cm_conditional_order(self, **params):
+        """Place new CM Conditional order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-CM-Conditional-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return self._request_papi_api('post', 'cm/conditional/order', signed=True, data=params)
+
+
+    def papi_create_margin_order(self, **params):
+        """New Margin Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-Margin-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return self._request_papi_api('post', 'margin/order', signed=True, data=params)
+
+
+    def papi_margin_loan(self, **params):
+        """Apply for a margin loan.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Borrow
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'marginLoan', signed=True, data=params)
+
+
+    def papi_repay_loan(self, **params):
+        """Repay for a margin loan.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Repay
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'repayLoan', signed=True, data=params)
+
+
+    def papi_margin_order_oco(self, **params):
+        """Send in a new OCO for a margin account.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-New-OCO
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'margin/order/oco', signed=True, data=params)
+
+
+    def papi_cancel_um_order(self, **params):
+        """Cancel an active UM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-UM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'um/order', signed=True, data=params)
+
+    def papi_cancel_um_all_open_orders(self, **params):
+        """Cancel an active UM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-UM-Open-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'um/allOpenOrders', signed=True, data=params)
+
+
+    def papi_cancel_um_conditional_order(self, **params):
+        """Cancel UM Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-UM-Conditional-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'um/conditional/order', signed=True, data=params)
+
+
+    def papi_cancel_um_conditional_all_open_orders(self, **params):
+        """Cancel All UM Open Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-UM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'um/conditional/allOpenOrders', signed=True, data=params)
+
+
+    def papi_cancel_cm_order(self, **params):
+        """Cancel an active CM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-CM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'cm/order', signed=True, data=params)
+
+    def papi_cancel_cm_all_open_orders(self, **params):
+        """Cancel an active CM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-CM-Open-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'cm/allOpenOrders', signed=True, data=params)
+
+    def papi_cancel_cm_conditional_order(self, **params):
+        """Cancel CM Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-CM-Conditional-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'cm/conditional/order', signed=True, data=params)
+
+
+    def papi_cancel_cm_conditional_all_open_orders(self, **params):
+        """Cancel All CM Open Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-CM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'cm/conditional/allOpenOrders', signed=True, data=params)
+
+
+    def papi_cancel_margin_order(self, **params):
+        """Cancel Margin Account Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-Margin-Account-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'margin/order', signed=True, data=params)
+
+
+    def papi_cancel_margin_order_list(self, **params):
+        """Cancel Margin Account OCO Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-Margin-Account-OCO-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'margin/orderList', signed=True, data=params)
+
+
+    def papi_cancel_margin_all_open_orders(self, **params):
+        """Cancel Margin Account All Open Orders on a Symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-Margin-Account-All-Open-Orders-on-a-Symbol
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('delete', 'margin/allOpenOrders', signed=True, data=params)
+
+
+    def papi_modify_um_order(self, **params):
+        """Order modify function, currently only LIMIT order modification is supported, modified orders will be reordered in the match queue.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Modify-UM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('put', 'um/order', signed=True, data=params)
+
+
+    def papi_modify_cm_order(self, **params):
+        """Order modify function, currently only LIMIT order modification is supported, modified orders will be reordered in the match queue.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Modify-CM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('put', 'cm/order', signed=True, data=params)
+
+    def papi_get_um_order(self, **params):
+        """Check an UM order's status.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/order', signed=True, data=params)
+
+
+    def papi_get_um_all_orders(self, **params):
+        """Get all account UM orders; active, canceled, or filled.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/allOrders', signed=True, data=params)
+
+
+    def papi_get_um_open_order(self, **params):
+        """Query current UM open order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-UM-Open-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/openOrder', signed=True, data=params)
+
+
+    def papi_get_um_open_orders(self, **params):
+        """Get all open orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-UM-Open-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/openOrders', signed=True, data=params)
+
+
+    def papi_get_um_conditional_all_orders(self, **params):
+        """Query All UM Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-UM-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/conditional/allOrders', signed=True, data=params)
+
+
+    def papi_get_um_conditional_open_orders(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-UM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/conditional/openOrders', signed=True, data=params)
+
+
+    def papi_get_um_conditional_open_order(self, **params):
+        """Query Current UM Open Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-UM-Open-Conditional-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/conditional/openOrder', signed=True, data=params)
+
+
+    def papi_get_um_conditional_order_history(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Conditional-Order-History
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/conditional/orderHistory', signed=True, data=params)
+
+
+
+    def papi_get_cm_order(self, **params):
+        """Check an CM order's status.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/order', signed=True, data=params)
+
+
+    def papi_get_cm_all_orders(self, **params):
+        """Get all account CM orders; active, canceled, or filled.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/allOrders', signed=True, data=params)
+
+
+    def papi_get_cm_open_order(self, **params):
+        """Query current CM open order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-CM-Open-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/openOrder', signed=True, data=params)
+
+
+    def papi_get_cm_open_orders(self, **params):
+        """Get all open orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-CM-Open-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/openOrders', signed=True, data=params)
+
+
+    def papi_get_cm_conditional_all_orders(self, **params):
+        """Query All CM Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-CM-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/conditional/allOrders', signed=True, data=params)
+
+
+    def papi_get_cm_conditional_open_orders(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-CM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/conditional/openOrders', signed=True, data=params)
+
+
+    def papi_get_cm_conditional_open_order(self, **params):
+        """Query Current UM Open Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-CM-Open-Conditional-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/conditional/openOrder', signed=True, data=params)
+
+
+    def papi_get_cm_conditional_order_history(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Conditional-Order-History
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/conditional/orderHistory', signed=True, data=params)
+
+
+    def papi_get_um_force_orders(self, **params):
+        """Query User's UM Force Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Users-UM-Force-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/forceOrders', signed=True, data=params)
+
+
+    def papi_get_cm_force_orders(self, **params):
+        """Query User's CM Force Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Users-CM-Force-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/forceOrders', signed=True, data=params)
+
+
+    def papi_get_um_order_amendment(self, **params):
+        """Get order modification history.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Modify-Order-History
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/orderAmendment', signed=True, data=params)
+
+
+    def papi_get_cm_order_amendment(self, **params):
+        """Get order modification history.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Modify-Order-History
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/orderAmendment', signed=True, data=params)
+
+
+    def papi_get_margin_force_orders(self, **params):
+        """Query user's margin force orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Users-Margin-Force-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/forceOrders', signed=True, data=params)
+
+    def papi_get_um_user_trades(self, **params):
+        """Get trades for a specific account and UM symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/UM-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/userTrades', signed=True, data=params)
+
+
+    def papi_get_cm_user_trades(self, **params):
+        """Get trades for a specific account and CM symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/CM-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/userTrades', signed=True, data=params)
+
+
+    def papi_get_um_adl_quantile(self, **params):
+        """Query UM Position ADL Quantile Estimation.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/UM-Position-ADL-Quantile-Estimation
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/adlQuantile', signed=True, data=params)
+
+
+    def papi_get_cm_adl_quantile(self, **params):
+        """Query CM Position ADL Quantile Estimation.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/CM-Position-ADL-Quantile-Estimation
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'cm/adlQuantile', signed=True, data=params)
+
+
+    def papi_set_um_fee_burn(self, **params):
+        """Change user's BNB Fee Discount for UM Futures (Fee Discount On or Fee Discount Off ) on EVERY symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Toggle-BNB-Burn-On-UM-Futures-Trade
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'um/feeBurn', signed=True, data=params)
+
+
+    def papi_get_um_fee_burn(self, **params):
+        """Get user's BNB Fee Discount for UM Futures (Fee Discount On or Fee Discount Off).
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Get-UM-Futures-BNB-Burn-Status
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'um/feeBurn', signed=True, data=params)
+
+
+    def papi_get_margin_order(self, **params):
+        """Query Margin Account Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/order', signed=True, data=params)
+
+
+    def papi_get_margin_open_orders(self, **params):
+        """Query Current Margin Open Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-Order
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/openOrders', signed=True, data=params)
+
+
+    def papi_get_margin_all_orders(self, **params):
+        """Query All Margin Account Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Margin-Account-Orders
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/allOrders', signed=True, data=params)
+
+
+    def papi_get_margin_order_list(self, **params):
+        """Retrieves a specific OCO based on provided optional parameters.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-OCO
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/orderList', signed=True, data=params)
+
+
+    def papi_get_margin_all_order_list(self, **params):
+        """Query all OCO for a specific margin account based on provided optional parameters.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-all-OCO
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/allOrderList', signed=True, data=params)
+
+
+    def papi_get_margin_open_order_list(self, **params):
+        """Query Margin Account's Open OCO.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-Open-OCO
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/openOrderList', signed=True, data=params)
+
+
+    def papi_get_margin_my_trades(self, **params):
+        """Margin Account Trade List.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('get', 'margin/myTrades', signed=True, data=params)
+
+
+    def papi_get_margin_repay_debt(self, **params):
+        """Repay debt for a margin loan.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return self._request_papi_api('post', 'margin/repay-debt', signed=True, data=params)
+
+
     def close_connection(self):
         if self.session:
             self.session.close()
@@ -8685,8 +10028,9 @@ class AsyncClient(BaseClient):
         base_endpoint: str = BaseClient.BASE_ENDPOINT_DEFAULT,
         testnet: bool = False, loop=None, session_params: Optional[Dict[str, Any]] = None,
         private_key: Optional[Union[str, Path]] = None, private_key_pass: Optional[str] = None,
+        https_proxy: Optional[str] = None
     ):
-
+        self.https_proxy = https_proxy
         self.loop = loop or get_loop()
         self._session_params: Dict[str, Any] = session_params or {}
         super().__init__(api_key, api_secret, requests_params, tld, base_endpoint, testnet, private_key, private_key_pass)
@@ -8696,10 +10040,12 @@ class AsyncClient(BaseClient):
         cls, api_key: Optional[str] = None, api_secret: Optional[str] = None,
         requests_params: Optional[Dict[str, Any]] = None, tld: str = 'com',
         base_endpoint: str = BaseClient.BASE_ENDPOINT_DEFAULT,
-        testnet: bool = False, loop=None, session_params: Optional[Dict[str, Any]] = None
+        testnet: bool = False, loop=None, session_params: Optional[Dict[str, Any]] = None,
+        https_proxy: Optional[str] = None
     ):
 
         self = cls(api_key, api_secret, requests_params, tld, base_endpoint, testnet, loop, session_params)
+        self.https_proxy = https_proxy # move this to the constructor
 
         try:
             await self.ping()
@@ -8733,7 +10079,7 @@ class AsyncClient(BaseClient):
 
         kwargs = self._get_request_kwargs(method, signed, force_params, **kwargs)
 
-        async with getattr(self.session, method)(uri, **kwargs) as response:
+        async with getattr(self.session, method)(uri, proxy=self.https_proxy, **kwargs) as response:
             self.response = response
             return await self._handle_response(response)
 
@@ -8755,9 +10101,10 @@ class AsyncClient(BaseClient):
         return await self._request(method, uri, signed, **kwargs)
 
     async def _request_futures_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_futures_api_uri(path, version=version)
 
-        return await self._request(method, uri, signed, True, **kwargs)
+        return await self._request(method, uri, signed, False, **kwargs)
 
     async def _request_futures_data_api(self, method, path, signed=False, **kwargs) -> Dict:
         uri = self._create_futures_data_api_uri(path)
@@ -8765,11 +10112,13 @@ class AsyncClient(BaseClient):
         return await self._request(method, uri, signed, True, **kwargs)
 
     async def _request_futures_coin_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_futures_coin_api_url(path, version=version)
 
         return await self._request(method, uri, signed, True, **kwargs)
 
     async def _request_futures_coin_data_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_futures_coin_data_api_url(path, version=version)
 
         return await self._request(method, uri, signed, True, **kwargs)
@@ -8780,7 +10129,14 @@ class AsyncClient(BaseClient):
         return await self._request(method, uri, signed, True, **kwargs)
 
     async def _request_margin_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
         uri = self._create_margin_api_uri(path, version)
+
+        return await self._request(method, uri, signed, **kwargs)
+
+    async def _request_papi_api(self, method, path, signed=False, version=1, **kwargs) -> Dict:
+        version = self._get_version(version, **kwargs)
+        uri = self._create_papi_api_uri(path, version)
 
         return await self._request(method, uri, signed, **kwargs)
 
@@ -9096,6 +10452,10 @@ class AsyncClient(BaseClient):
         return await self._get('ticker/price', data=params, version=self.PRIVATE_API_VERSION)
     get_symbol_ticker.__doc__ = Client.get_symbol_ticker.__doc__
 
+    async def get_symbol_ticker_window(self, **params):
+        return await self._get('ticker', data=params, version=self.PRIVATE_API_VERSION)
+    get_symbol_ticker_window.__doc__ = Client.get_symbol_ticker_window.__doc__
+
     async def get_orderbook_ticker(self, **params):
         return await self._get('ticker/bookTicker', data=params, version=self.PRIVATE_API_VERSION)
     get_orderbook_ticker.__doc__ = Client.get_orderbook_ticker.__doc__
@@ -9103,6 +10463,8 @@ class AsyncClient(BaseClient):
     # Account Endpoints
 
     async def create_order(self, **params):
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.SPOT_ORDER_PREFIX + self.uuid22()
         return await self._post('order', True, data=params)
     create_order.__doc__ = Client.create_order.__doc__
 
@@ -9263,11 +10625,11 @@ class AsyncClient(BaseClient):
     query_universal_transfer_history.__doc__ = Client.query_universal_transfer_history.__doc__
 
     async def get_trade_fee(self, **params):
-        if self.tld == 'us'
+        if self.tld == 'us':
             endpoint = 'asset/query/trading-fee'
         else:
             endpoint = 'asset/tradeFee'
-        return await self._request_margin_api('get', 'endpoint', True, data=params)
+        return await self._request_margin_api('get', endpoint, True, data=params)
     get_trade_fee.__doc__ = Client.get_trade_fee.__doc__
 
     async def get_asset_details(self, **params):
@@ -9476,6 +10838,8 @@ class AsyncClient(BaseClient):
     repay_margin_loan.__doc__ = Client.repay_margin_loan.__doc__
 
     async def create_margin_order(self, **params):
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.SPOT_ORDER_PREFIX + self.uuid22()
         return await self._request_margin_api('post', 'margin/order', signed=True, data=params)
     create_margin_order.__doc__ = Client.create_margin_order.__doc__
 
@@ -9540,7 +10904,7 @@ class AsyncClient(BaseClient):
         return await self._request_margin_api('get', 'margin/orderList', signed=True, data=params)
 
     async def get_open_margin_oco_orders(self, **params):
-        return await self._request_margin_api('get', 'margin/allOrderList', signed=True, data=params)
+        return await self._request_margin_api('get', 'margin/openOrderList', signed=True, data=params)
 
     # Cross-margin
 
@@ -9863,6 +11227,8 @@ class AsyncClient(BaseClient):
         return await self._request_margin_api('get', 'futures/loan/interestHistory', True, data=params)
 
     async def futures_create_order(self, **params):
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
         return await self._request_futures_api('post', 'order', True, data=params)
 
     async def futures_create_test_order(self, **params):
@@ -9894,9 +11260,9 @@ class AsyncClient(BaseClient):
 
     async def futures_countdown_cancel_all(self, **params):
         return await self._request_futures_api('post', 'countdownCancelAll', True, data=params)
-    
+
     async def futures_account_balance(self, **params):
-        return await self._request_futures_api('get', 'balance', True, version=2, data=params)
+        return await self._request_futures_api('get', 'balance', True, version=3, data=params)
 
     async def futures_account(self, **params):
         return await self._request_futures_api('get', 'account', True, version=2, data=params)
@@ -9914,7 +11280,7 @@ class AsyncClient(BaseClient):
         return await self._request_futures_api('get', 'positionMargin/history', True, data=params)
 
     async def futures_position_information(self, **params):
-        return await self._request_futures_api('get', 'positionRisk', True, version=2, data=params)
+        return await self._request_futures_api('get', 'positionRisk', True, version=3, data=params)
 
     async def futures_account_trades(self, **params):
         return await self._request_futures_api('get', 'userTrades', True, data=params)
@@ -9952,6 +11318,13 @@ class AsyncClient(BaseClient):
             'listenKey': listenKey
         }
         return await self._request_futures_api('delete', 'listenKey', signed=False, data=params)
+
+    # new methods
+    async def futures_account_config(self, **params):
+        return await self._request_futures_api('get', 'accountConfig', signed=True, version=1, data=params)
+
+    async def futures_symbol_config(self, **params):
+        return await self._request_futures_api('get', 'symbolConfig', signed=True, version=1, data=params)
 
     # COIN Futures API
 
@@ -10196,6 +11569,8 @@ class AsyncClient(BaseClient):
         return await self._request_options_api('post', 'bill', signed=True, data=params)
 
     async def options_place_order(self, **params):
+        if 'clientOrderId' not in params:
+            params['clientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
         return await self._request_options_api('post', 'order', signed=True, data=params)
 
     async def options_place_batch_order(self, **params):
@@ -10254,3 +11629,780 @@ class AsyncClient(BaseClient):
     async def convert_accept_quote(self, **params):
         return await self._request_margin_api('post', 'convert/acceptQuote', signed=True, data=params)
     convert_accept_quote.__doc__ = Client.convert_accept_quote.__doc__
+
+    """
+    ====================================================================================================================
+    PortfolioMargin API
+    ====================================================================================================================
+    """
+
+    async def papi_get_balance(self, **params):
+        return await self._request_papi_api('get', 'balance', signed=True, data=params)
+
+    async def papi_get_account(self, **params):
+        return await self._request_papi_api('get', 'account', signed=True, data=params)
+
+    async def papi_get_margin_max_borrowable(self, **params):
+        return await self._request_papi_api('get', 'margin/maxBorrowable', signed=True, data=params)
+
+    async def papi_get_margin_max_withdraw(self, **params):
+        return await self._request_papi_api('get', 'margin/maxWithdraw', signed=True, data=params)
+
+    async def papi_get_um_position_risk(self, **params):
+        return await self._request_papi_api('get', 'um/positionRisk', signed=True, data=params)
+
+    async def papi_get_cm_position_risk(self, **params):
+        return await self._request_papi_api('get', 'cm/positionRisk', signed=True, data=params)
+
+    async def papi_set_um_leverage(self, **params):
+        return await self._request_papi_api('post', 'um/leverage', signed=True, data=params)
+
+
+    async def papi_set_cm_leverage(self, **params):
+        return await self._request_papi_api('post', 'cm/leverage', signed=True, data=params)
+
+
+    async def papi_change_um_position_side_dual(self, **params):
+        return await self._request_papi_api('post', 'um/positionSide/dual', signed=True, data=params)
+
+
+    async def papi_get_um_position_side_dual(self, **params):
+        return await self._request_papi_api('get', 'um/positionSide/dual', signed=True, data=params)
+
+
+    async def papi_get_cm_position_side_dual(self, **params):
+        return await self._request_papi_api('get', 'cm/positionSide/dual', signed=True, data=params)
+
+
+    async def papi_get_um_leverage_bracket(self, **params):
+        return await self._request_papi_api('get', 'um/leverageBracket', signed=True, data=params)
+
+
+    async def papi_get_cm_leverage_bracket(self, **params):
+        return await self._request_papi_api('get', 'cm/leverageBracket', signed=True, data=params)
+
+    async def papi_get_um_api_trading_status(self, **params):
+        return await self._request_papi_api('get', 'um/apiTradingStatus', signed=True, data=params)
+
+
+    async def papi_get_um_comission_rate(self, **params):
+        return await self._request_papi_api('get', 'um/commissionRate', signed=True, data=params)
+
+
+    async def papi_get_cm_comission_rate(self, **params):
+        return await self._request_papi_api('get', 'cm/commissionRate', signed=True, data=params)
+
+    async def papi_get_margin_margin_loan(self, **params):
+        return await self._request_papi_api('get', 'margin/marginLoan', signed=True, data=params)
+
+    async def papi_get_margin_repay_loan(self, **params):
+        return await self._request_papi_api('get', 'margin/repayLoan', signed=True, data=params)
+
+
+    async def papi_get_repay_futures_switch(self, **params):
+        return await self._request_papi_api('get', 'repay-futures-switch', signed=True, data=params)
+
+
+    async def papi_repay_futures_switch(self, **params):
+        return await self._request_papi_api('post', 'repay-futures-switch', signed=True, data=params)
+
+
+    async def papi_get_margin_interest_history(self, **params):
+        return await self._request_papi_api('get', 'margin/marginInterestHistory', signed=True, data=params)
+
+
+    async def papi_repay_futures_negative_balance(self, **params):
+        return await self._request_papi_api('post', 'repay-futures-negative-balance', signed=True, data=params)
+
+
+    async def papi_get_portfolio_interest_history(self, **params):
+        return await self._request_papi_api('get', 'portfolio/interest-history', signed=True, data=params)
+
+
+    async def papi_fund_auto_collection(self, **params):
+        return await self._request_papi_api('post', 'auto-collection', signed=True, data=params)
+
+
+    async def papi_fund_asset_collection(self, **params):
+        return await self._request_papi_api('post', 'asset-collection', signed=True, data=params)
+
+
+    async def papi_bnb_transfer(self, **params):
+        return await self._request_papi_api('post', 'bnb-transfer', signed=True, data=params)
+
+
+    async def papi_get_um_income_history(self, **params):
+        return await self._request_papi_api('get', 'um/income', signed=True, data=params)
+
+
+    async def papi_get_cm_income_history(self, **params):
+        return await self._request_papi_api('get', 'cm/income', signed=True, data=params)
+
+
+    async def papi_get_um_account(self, **params):
+        return await self._request_papi_api('get', 'um/account', signed=True, data=params)
+
+    async def papi_get_um_account_v2(self, **params):
+        return await self._request_papi_api('get', 'um/account', version=2, signed=True, data=params)
+
+
+    async def papi_get_cm_account(self, **params):
+        return await self._request_papi_api('get', 'cm/account', signed=True, data=params)
+
+
+    async def papi_get_um_account_config(self, **params):
+        return await self._request_papi_api('get', 'um/accountConfig', signed=True, data=params)
+
+
+    async def papi_get_um_symbol_config(self, **params):
+        return await self._request_papi_api('get', 'um/symbolConfig', signed=True, data=params)
+
+
+    async def papi_get_um_trade_asyn(self, **params):
+        return await self._request_papi_api('get', 'um/trade/asyn', signed=True, data=params)
+
+
+    async def papi_get_um_trade_asyn_id(self, **params):
+        return await self._request_papi_api('get', 'um/trade/asyn/id', signed=True, data=params)
+
+    async def papi_get_um_order_asyn(self, **params):
+        return await self._request_papi_api('get', 'um/order/asyn', signed=True, data=params)
+
+
+    async def papi_get_um_order_asyn_id(self, **params):
+        return await self._request_papi_api('get', 'um/order/asyn/id', signed=True, data=params)
+
+
+    async def papi_get_um_income_asyn(self, **params):
+        return await self._request_papi_api('get', 'um/income/asyn', signed=True, data=params)
+
+
+    async def papi_get_um_income_asyn_id(self, **params):
+        return await self._request_papi_api('get', 'um/income/asyn/id', signed=True, data=params)
+
+
+    async def papi_ping(self, **params):
+        return await self._request_papi_api('get', 'ping', signed=False, data=params)
+
+    # papi trading endpoints
+
+    async def papi_create_um_order(self, **params):
+        """Place new UM order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return await self._request_papi_api('post', 'um/order', signed=True, data=params)
+
+
+    async def papi_create_um_conditional_order(self, **params):
+        """Place new UM Conditional order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-UM-Conditional-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return await self._request_papi_api('post', 'um/conditional/order', signed=True, data=params)
+
+
+    async def papi_create_cm_order(self, **params):
+        """Place new CM order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-CM-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return await self._request_papi_api('post', 'cm/order', signed=True, data=params)
+
+
+    async def papi_create_cm_conditional_order(self, **params):
+        """Place new CM Conditional order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-CM-Conditional-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return await self._request_papi_api('post', 'cm/conditional/order', signed=True, data=params)
+
+
+    async def papi_create_margin_order(self, **params):
+        """New Margin Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-Margin-Order
+
+        :returns: API response
+
+        """
+        if 'newClientOrderId' not in params:
+            params['newClientOrderId'] = self.CONTRACT_ORDER_PREFIX + self.uuid22()
+        return await self._request_papi_api('post', 'margin/order', signed=True, data=params)
+
+
+    async def papi_margin_loan(self, **params):
+        """Apply for a margin loan.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Borrow
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('post', 'marginLoan', signed=True, data=params)
+
+
+    async def papi_repay_loan(self, **params):
+        """Repay for a margin loan.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Repay
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('post', 'repayLoan', signed=True, data=params)
+
+
+    async def papi_margin_order_oco(self, **params):
+        """Send in a new OCO for a margin account.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-New-OCO
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('post', 'margin/order/oco', signed=True, data=params)
+
+
+    async def papi_cancel_um_order(self, **params):
+        """Cancel an active UM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-UM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'um/order', signed=True, data=params)
+
+    async def papi_cancel_um_all_open_orders(self, **params):
+        """Cancel an active UM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-UM-Open-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'um/allOpenOrders', signed=True, data=params)
+
+
+    async def papi_cancel_um_conditional_order(self, **params):
+        """Cancel UM Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-UM-Conditional-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'um/conditional/order', signed=True, data=params)
+
+
+    async def papi_cancel_um_conditional_all_open_orders(self, **params):
+        """Cancel All UM Open Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-UM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'um/conditional/allOpenOrders', signed=True, data=params)
+
+
+    async def papi_cancel_cm_order(self, **params):
+        """Cancel an active CM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-CM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'cm/order', signed=True, data=params)
+
+    async def papi_cancel_cm_all_open_orders(self, **params):
+        """Cancel an active CM LIMIT order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-CM-Open-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'cm/allOpenOrders', signed=True, data=params)
+
+    async def papi_cancel_cm_conditional_order(self, **params):
+        """Cancel CM Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-CM-Conditional-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'cm/conditional/order', signed=True, data=params)
+
+
+    async def papi_cancel_cm_conditional_all_open_orders(self, **params):
+        """Cancel All CM Open Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-All-CM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'cm/conditional/allOpenOrders', signed=True, data=params)
+
+
+    async def papi_cancel_margin_order(self, **params):
+        """Cancel Margin Account Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-Margin-Account-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'margin/order', signed=True, data=params)
+
+
+    async def papi_cancel_margin_order_list(self, **params):
+        """Cancel Margin Account OCO Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-Margin-Account-OCO-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'margin/orderList', signed=True, data=params)
+
+
+    async def papi_cancel_margin_all_open_orders(self, **params):
+        """Cancel Margin Account All Open Orders on a Symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Cancel-Margin-Account-All-Open-Orders-on-a-Symbol
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('delete', 'margin/allOpenOrders', signed=True, data=params)
+
+
+    async def papi_modify_um_order(self, **params):
+        """Order modify function, currently only LIMIT order modification is supported, modified orders will be reordered in the match queue.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Modify-UM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('put', 'um/order', signed=True, data=params)
+
+
+    async def papi_modify_cm_order(self, **params):
+        """Order modify function, currently only LIMIT order modification is supported, modified orders will be reordered in the match queue.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Modify-CM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('put', 'cm/order', signed=True, data=params)
+
+    async def papi_get_um_order(self, **params):
+        """Check an UM order's status.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/order', signed=True, data=params)
+
+
+    async def papi_get_um_all_orders(self, **params):
+        """Get all account UM orders; active, canceled, or filled.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/allOrders', signed=True, data=params)
+
+
+    async def papi_get_um_open_order(self, **params):
+        """Query current UM open order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-UM-Open-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/openOrder', signed=True, data=params)
+
+
+    async def papi_get_um_open_orders(self, **params):
+        """Get all open orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-UM-Open-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/openOrders', signed=True, data=params)
+
+
+    async def papi_get_um_conditional_all_orders(self, **params):
+        """Query All UM Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-UM-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/conditional/allOrders', signed=True, data=params)
+
+
+    async def papi_get_um_conditional_open_orders(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-UM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/conditional/openOrders', signed=True, data=params)
+
+
+    async def papi_get_um_conditional_open_order(self, **params):
+        """Query Current UM Open Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-UM-Open-Conditional-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/conditional/openOrder', signed=True, data=params)
+
+
+    async def papi_get_um_conditional_order_history(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Conditional-Order-History
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/conditional/orderHistory', signed=True, data=params)
+
+
+
+    async def papi_get_cm_order(self, **params):
+        """Check an CM order's status.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/order', signed=True, data=params)
+
+
+    async def papi_get_cm_all_orders(self, **params):
+        """Get all account CM orders; active, canceled, or filled.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/allOrders', signed=True, data=params)
+
+
+    async def papi_get_cm_open_order(self, **params):
+        """Query current CM open order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-CM-Open-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/openOrder', signed=True, data=params)
+
+
+    async def papi_get_cm_open_orders(self, **params):
+        """Get all open orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-CM-Open-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/openOrders', signed=True, data=params)
+
+
+    async def papi_get_cm_conditional_all_orders(self, **params):
+        """Query All CM Conditional Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-CM-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/conditional/allOrders', signed=True, data=params)
+
+
+    async def papi_get_cm_conditional_open_orders(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Current-CM-Open-Conditional-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/conditional/openOrders', signed=True, data=params)
+
+
+    async def papi_get_cm_conditional_open_order(self, **params):
+        """Query Current UM Open Conditional Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Current-CM-Open-Conditional-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/conditional/openOrder', signed=True, data=params)
+
+
+    async def papi_get_cm_conditional_order_history(self, **params):
+        """Get all open conditional orders on a symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Conditional-Order-History
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/conditional/orderHistory', signed=True, data=params)
+
+
+    async def papi_get_um_force_orders(self, **params):
+        """Query User's UM Force Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Users-UM-Force-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/forceOrders', signed=True, data=params)
+
+
+    async def papi_get_cm_force_orders(self, **params):
+        """Query User's CM Force Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Users-CM-Force-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/forceOrders', signed=True, data=params)
+
+
+    async def papi_get_um_order_amendment(self, **params):
+        """Get order modification history.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-UM-Modify-Order-History
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/orderAmendment', signed=True, data=params)
+
+
+    async def papi_get_cm_order_amendment(self, **params):
+        """Get order modification history.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-CM-Modify-Order-History
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/orderAmendment', signed=True, data=params)
+
+
+    async def papi_get_margin_force_orders(self, **params):
+        """Query user's margin force orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Users-Margin-Force-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/forceOrders', signed=True, data=params)
+
+    async def papi_get_um_user_trades(self, **params):
+        """Get trades for a specific account and UM symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/UM-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/userTrades', signed=True, data=params)
+
+
+    async def papi_get_cm_user_trades(self, **params):
+        """Get trades for a specific account and CM symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/CM-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/userTrades', signed=True, data=params)
+
+
+    async def papi_get_um_adl_quantile(self, **params):
+        """Query UM Position ADL Quantile Estimation.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/UM-Position-ADL-Quantile-Estimation
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/adlQuantile', signed=True, data=params)
+
+
+    async def papi_get_cm_adl_quantile(self, **params):
+        """Query CM Position ADL Quantile Estimation.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/CM-Position-ADL-Quantile-Estimation
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'cm/adlQuantile', signed=True, data=params)
+
+
+    async def papi_set_um_fee_burn(self, **params):
+        """Change user's BNB Fee Discount for UM Futures (Fee Discount On or Fee Discount Off ) on EVERY symbol.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Toggle-BNB-Burn-On-UM-Futures-Trade
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('post', 'um/feeBurn', signed=True, data=params)
+
+
+    async def papi_get_um_fee_burn(self, **params):
+        """Get user's BNB Fee Discount for UM Futures (Fee Discount On or Fee Discount Off).
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Get-UM-Futures-BNB-Burn-Status
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'um/feeBurn', signed=True, data=params)
+
+
+    async def papi_get_margin_order(self, **params):
+        """Query Margin Account Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/order', signed=True, data=params)
+
+
+    async def papi_get_margin_open_orders(self, **params):
+        """Query Current Margin Open Order.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-Order
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/openOrders', signed=True, data=params)
+
+
+    async def papi_get_margin_all_orders(self, **params):
+        """Query All Margin Account Orders.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-All-Margin-Account-Orders
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/allOrders', signed=True, data=params)
+
+
+    async def papi_get_margin_order_list(self, **params):
+        """Retrieves a specific OCO based on provided optional parameters.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-OCO
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/orderList', signed=True, data=params)
+
+
+    async def papi_get_margin_all_order_list(self, **params):
+        """Query all OCO for a specific margin account based on provided optional parameters.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-all-OCO
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/allOrderList', signed=True, data=params)
+
+
+    async def papi_get_margin_open_order_list(self, **params):
+        """Query Margin Account's Open OCO.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Query-Margin-Account-Open-OCO
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/openOrderList', signed=True, data=params)
+
+
+    async def papi_get_margin_my_trades(self, **params):
+        """Margin Account Trade List.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('get', 'margin/myTrades', signed=True, data=params)
+
+
+    async def papi_get_margin_repay_debt(self, **params):
+        """Repay debt for a margin loan.
+
+        https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Margin-Account-Trade-List
+
+        :returns: API response
+
+        """
+        return await self._request_papi_api('post', 'margin/repay-debt', signed=True, data=params)
